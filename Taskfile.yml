@@ -2,13 +2,11 @@
 
 version: "3"
 
-vars:
-  GREETING: Hello, World!
-
 tasks:
-  test:
+  install:
     cmds:
-      - uv run pytest
+      - uv sync --dev
+      - uv run pre-commit install
 
   watch-tests:
     cmds:
