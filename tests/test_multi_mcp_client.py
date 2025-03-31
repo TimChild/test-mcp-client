@@ -1,5 +1,7 @@
+import asyncio
+
 import pytest
-from langchain_mcp_adapters.client import StdioConnection
+from langchain_mcp_adapters.client import SSEConnection, StdioConnection
 
 from mcp_client import MultiMCPClient
 from mcp_client.multi_client import MCPServerConnectionError
@@ -23,6 +25,13 @@ def _stdio_connection_from_path(path: str) -> StdioConnection:
     )
 
 
+def _sse_connection_from_path(path: str) -> SSEConnection:
+    return SSEConnection(
+        transport="sse",
+        url=path,
+    )
+
+
 def test_init_with_connections():
     example_server_conn = _stdio_connection_from_path("tests/example_mcp_server.py")
     multi_mcp_client = MultiMCPClient(connections={"example": example_server_conn})
@@ -33,6 +42,18 @@ def test_init_with_connections():
 def client() -> MultiMCPClient:
     example_server_conn = _stdio_connection_from_path("tests/example_mcp_server.py")
     return MultiMCPClient(connections={"example": example_server_conn})
+
+
+@pytest.fixture
+def client_with_missing_servers() -> MultiMCPClient:
+    conns = {
+        "example": _stdio_connection_from_path("tests/example_mcp_server.py"),
+        "missing_stdio": _stdio_connection_from_path("non_existent.py"),
+        "missing_sse": _sse_connection_from_path("https://missing-server.com"),
+    }
+    mcp_client = MultiMCPClient(connections=conns)
+    mcp_client.set_connection_timeout(0.5)
+    return mcp_client
 
 
 async def test_get_tools(client: MultiMCPClient):
@@ -48,17 +69,21 @@ async def test_call_tool(client: MultiMCPClient):
     assert result == {"data": "Hello World!"}
 
 
-async def test_handles_missing_servers():
+class TestPing:
+    async def test_ping(self, client: MultiMCPClient):
+        errors = await asyncio.wait_for(client.ping_servers(), timeout=1)
+        assert errors == {}
+
+    async def test_ping_with_errors(self, client_with_missing_servers: MultiMCPClient):
+        errors = await asyncio.wait_for(client_with_missing_servers.ping_servers(), timeout=1)
+        assert len(errors) == 2
+        assert "missing_stdio" in errors
+        assert "missing_sse" in errors
+
+
+async def test_handles_missing_servers(client_with_missing_servers: MultiMCPClient):
     """Should handle missing servers gracefully."""
-    example_server_conn = _stdio_connection_from_path("tests/example_mcp_server.py")
-    missing_server_conn = _stdio_connection_from_path("missing-server.py")
-    multi_mcp_client = MultiMCPClient(
-        connections={
-            "example": example_server_conn,
-            "missing": missing_server_conn,
-        }
-    )
-    multi_mcp_client.set_connection_timeout(0.5)
+    multi_mcp_client = client_with_missing_servers
     assert isinstance(multi_mcp_client, MultiMCPClient)
 
     async with multi_mcp_client:
@@ -66,12 +91,16 @@ async def test_handles_missing_servers():
         assert len(tools) > 0, "Should still find the example tools"
         assert tools[0].name == "test-tool"
 
-    assert len(multi_mcp_client.errored_servers) == 1
-    assert "missing" in multi_mcp_client.errored_servers
+    assert len(multi_mcp_client.errored_servers) == 2
+    assert "missing_stdio" in multi_mcp_client.errored_servers
+    assert "missing_sse" in multi_mcp_client.errored_servers
 
     async with multi_mcp_client:
         response = await multi_mcp_client.call_tool(server_name="example", tool_name="test-tool")
         assert response is not None
 
         with pytest.raises(MCPServerConnectionError):
-            _ = await multi_mcp_client.call_tool(server_name="missing", tool_name="test-tool")
+            _ = await multi_mcp_client.call_tool(server_name="missing_stdio", tool_name="test-tool")
+
+        with pytest.raises(MCPServerConnectionError):
+            _ = await multi_mcp_client.call_tool(server_name="missing_sse", tool_name="test-tool")

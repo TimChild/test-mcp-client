@@ -4,6 +4,7 @@ import logging
 import uuid
 from typing import Any
 
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from langchain_core.messages.tool import ToolCall
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import (
@@ -12,7 +13,8 @@ from langchain_mcp_adapters.client import (
     StdioConnection,
 )
 from langchain_mcp_adapters.tools import load_mcp_tools
-from mcp import ClientSession
+from mcp import ClientSession, InitializeResult, StdioServerParameters, stdio_client
+from mcp.client.sse import sse_client
 
 
 class MCPServerConnectionError(Exception):
@@ -21,7 +23,6 @@ class MCPServerConnectionError(Exception):
 
 class LCClientPatch(MultiServerMCPClient):
     initialize_timeout_s: float = 5
-    errored_servers: dict[str, Exception] = {}
 
     async def __aenter__(self) -> "LCClientPatch":
         """Connect to all servers during context."""
@@ -47,7 +48,6 @@ class LCClientPatch(MultiServerMCPClient):
             #  but there I can't know which server it was for. (my PR to mcp may help with this)
         except Exception as e:
             logging.error(f"Failed to initialize session for {server_name}: {e}")
-            self.errored_servers[server_name] = e
             return
 
         self.sessions[server_name] = session
@@ -55,6 +55,9 @@ class LCClientPatch(MultiServerMCPClient):
         # Load tools from this server
         server_tools = await load_mcp_tools(session)
         self.server_name_to_tools[server_name] = server_tools
+
+
+ErroredServers = dict[str, tuple[SSEConnection | StdioConnection, Exception]]
 
 
 class MultiMCPClient:
@@ -68,16 +71,51 @@ class MultiMCPClient:
         self.connections = connections
         self.lc_client: LCClientPatch = LCClientPatch(connections=connections)
         self._context_depth = 0
+        self.timeout = 1
+        self.errored_servers: ErroredServers = {}
 
-    @property
-    def errored_servers(self) -> dict[str, Exception]:
-        return self.lc_client.errored_servers
+    async def ping_servers(self) -> dict[str, Exception]:
+        async def send_ping(
+            transport: tuple[MemoryObjectReceiveStream, MemoryObjectSendStream],
+        ) -> InitializeResult:
+            read, write = transport
+            async with ClientSession(read, write) as session:
+                init = await session.initialize()
+                await session.send_ping()
+                return init
+
+        errors: dict[str, Exception] = {}
+        for server_name, connection in self.connections.items():
+            try:
+                if connection["transport"] == "stdio":
+                    params = StdioServerParameters(
+                        command=connection["command"], args=connection["args"]
+                    )
+                    async with stdio_client(params) as transport:
+                        await send_ping(transport)
+                if connection["transport"] == "sse":
+                    async with sse_client(url=connection["url"], timeout=self.timeout) as transport:
+                        await send_ping(transport)
+            except Exception as e:
+                errors[server_name] = e
+        return errors
+
+    async def check_connections(self) -> None:
+        errors = await self.ping_servers()
+        if errors:
+            for server_name, error in errors.items():
+                logging.error(
+                    f"Failed to connect to {server_name}: {error} -- Removing from connections"
+                )
+                conn = self.connections.pop(server_name)
+                self.errored_servers[server_name] = (conn, error)
 
     async def __aenter__(self) -> "MultiMCPClient":
         """Connects to all servers during context."""
         if self._context_depth < 0:
             raise RuntimeError("Context manager has already exited")
         if self._context_depth == 0:
+            await self.check_connections()
             self.lc_client = await self.lc_client.__aenter__()
         self._context_depth += 1
         return self
@@ -88,10 +126,7 @@ class MultiMCPClient:
             raise RuntimeError("Context manager has already exited")
         self._context_depth -= 1
         if self._context_depth == 0:
-            try:
-                await self.lc_client.__aexit__(exc_type, exc_value, traceback)
-            except ExceptionGroup as e:
-                logging.error(f"Errors closing connections: {e}")
+            await self.lc_client.__aexit__(exc_type, exc_value, traceback)
 
     async def get_tools(self) -> list[BaseTool]:
         """Get all tools available from all connected servers."""
