@@ -2,11 +2,9 @@ import asyncio
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
-from langchain_core.messages import AIMessage
-from langchain_core.messages.tool import ToolCall, ToolMessage
+from langchain_core.messages.tool import ToolCall
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import (
     MultiServerMCPClient,
@@ -17,8 +15,18 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from mcp import ClientSession
 
 
+class MCPServerConnectionError(Exception):
+    pass
+
+
 class LCClientPatch(MultiServerMCPClient):
     initialize_timeout_s: float = 5
+    errored_servers: dict[str, Exception] = {}
+
+    async def __aenter__(self) -> "LCClientPatch":
+        """Connect to all servers during context."""
+        await super().__aenter__()
+        return self
 
     # added timeout on intiaializing a session
     async def _initialize_session_and_load_tools(
@@ -32,9 +40,16 @@ class LCClientPatch(MultiServerMCPClient):
         """
         # Initialize the session
         try:
+            # raise Exception
             await asyncio.wait_for(session.initialize(), timeout=self.initialize_timeout_s)
-        except asyncio.TimeoutError:
-            raise RuntimeError("Failed to initialize session within timeout")
+            # NOTE: The problem is that this may only get the timeout error.
+            #  The actual error ends up only getting caught in the exit stack
+            #  but there I can't know which server it was for. (my PR to mcp may help with this)
+        except Exception as e:
+            logging.error(f"Failed to initialize session for {server_name}: {e}")
+            self.errored_servers[server_name] = e
+            return
+
         self.sessions[server_name] = session
 
         # Load tools from this server
@@ -51,12 +66,15 @@ class MultiMCPClient:
                 Each configuration can be either a StdioConnection or SSEConnection.
         """
         self.connections = connections
-        self.lc_client = LCClientPatch(connections=connections)
+        self.lc_client: LCClientPatch = LCClientPatch(connections=connections)
         self._context_depth = 0
+
+    @property
+    def errored_servers(self) -> dict[str, Exception]:
+        return self.lc_client.errored_servers
 
     async def __aenter__(self) -> "MultiMCPClient":
         """Connects to all servers during context."""
-        logging.critical("Entering context")
         if self._context_depth < 0:
             raise RuntimeError("Context manager has already exited")
         if self._context_depth == 0:
@@ -66,12 +84,14 @@ class MultiMCPClient:
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:  # noqa: ANN001
         """Closes all server connections."""
-        print("Exiting context")
         if self._context_depth <= 0:
             raise RuntimeError("Context manager has already exited")
         self._context_depth -= 1
         if self._context_depth == 0:
-            await self.lc_client.__aexit__(exc_type, exc_value, traceback)
+            try:
+                await self.lc_client.__aexit__(exc_type, exc_value, traceback)
+            except ExceptionGroup as e:
+                logging.error(f"Errors closing connections: {e}")
 
     async def get_tools(self) -> list[BaseTool]:
         """Get all tools available from all connected servers."""
@@ -84,6 +104,12 @@ class MultiMCPClient:
 
         Returns whatever the tool returns.
         """
+        if server_name not in self.lc_client.server_name_to_tools:
+            if server_name in self.errored_servers:
+                raise MCPServerConnectionError(
+                    f"Server {server_name} failed to connect {self.errored_servers[server_name]}"
+                )
+            raise ValueError(f"Server {server_name} not in connected servers")
         async with self:
             server_tools = self.lc_client.server_name_to_tools[server_name]
             tool = next(t for t in server_tools if t.name == tool_name)
@@ -99,5 +125,7 @@ class MultiMCPClient:
                 return json.loads(tool_content)
             except json.JSONDecodeError:
                 return tool_content
-            print(type(tool_content))
-            return ToolMessage(tool_call_id=tool_call["id"], content=tool_content)
+
+    def set_connection_timeout(self, timeout_s: float) -> None:
+        """Set the timeout for initializing a session."""
+        self.lc_client.initialize_timeout_s = timeout_s
