@@ -2,9 +2,8 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, AsyncContextManager
 
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from langchain_core.messages.tool import ToolCall
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import (
@@ -76,13 +75,13 @@ class MultiMCPClient:
 
     async def ping_servers(self) -> dict[str, Exception]:
         async def send_ping(
-            transport: tuple[MemoryObjectReceiveStream, MemoryObjectSendStream],
+            client_context_manager: AsyncContextManager,
         ) -> InitializeResult:
-            read, write = transport
-            async with ClientSession(read, write) as session:
-                init = await session.initialize()
-                await session.send_ping()
-                return init
+            async with client_context_manager as (read, write):
+                async with ClientSession(read, write) as session:
+                    init = await session.initialize()
+                    await session.send_ping()
+                    return init
 
         errors: dict[str, Exception] = {}
         for server_name, connection in self.connections.items():
@@ -91,11 +90,15 @@ class MultiMCPClient:
                     params = StdioServerParameters(
                         command=connection["command"], args=connection["args"]
                     )
-                    async with stdio_client(params) as transport:
-                        await send_ping(transport)
+                    await asyncio.wait_for(
+                        send_ping(stdio_client(params)),
+                        timeout=self.timeout,
+                    )
                 if connection["transport"] == "sse":
-                    async with sse_client(url=connection["url"], timeout=self.timeout) as transport:
-                        await send_ping(transport)
+                    await asyncio.wait_for(
+                        send_ping(sse_client(url=connection["url"])),
+                        timeout=self.timeout,
+                    )
             except Exception as e:
                 errors[server_name] = e
         return errors

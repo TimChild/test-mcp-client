@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 from langchain_mcp_adapters.client import SSEConnection, StdioConnection
@@ -71,11 +72,17 @@ async def test_call_tool(client: MultiMCPClient):
 
 class TestPing:
     async def test_ping(self, client: MultiMCPClient):
+        client.set_connection_timeout(0.3)
+        t = time.time()
         errors = await asyncio.wait_for(client.ping_servers(), timeout=1)
+        assert time.time() - t < 0.8
         assert errors == {}
 
     async def test_ping_with_errors(self, client_with_missing_servers: MultiMCPClient):
-        errors = await asyncio.wait_for(client_with_missing_servers.ping_servers(), timeout=1)
+        client_with_missing_servers.set_connection_timeout(0.5)
+        t = time.time()
+        errors = await asyncio.wait_for(client_with_missing_servers.ping_servers(), timeout=2)
+        assert time.time() - t < 1.5
         assert len(errors) == 2
         assert "missing_stdio" in errors
         assert "missing_sse" in errors
