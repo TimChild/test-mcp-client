@@ -8,6 +8,11 @@ tasks:
       - uv sync --dev
       - uv run pre-commit install
 
+  test:
+    desc: Run all tests
+    cmds:
+      - uv run pytest
+
   watch-tests:
     cmds:
       - find tests mcp_client -type f -not -path '*/__pycache__/*' | entr uv run pytest
