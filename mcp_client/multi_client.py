@@ -2,10 +2,10 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, AsyncContextManager
+from typing import Any, AsyncContextManager, cast
 
 from langchain_core.messages.tool import ToolCall
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import StructuredTool
 from langchain_mcp_adapters.client import (
     MultiServerMCPClient,
     SSEConnection,
@@ -104,6 +104,11 @@ class MultiMCPClient:
         return errors
 
     async def check_connections(self) -> None:
+        """Simple short lived connection to check servers are accessible.
+
+        Returns:
+            dict[str, Exception]: A dictionary mapping server names to any exceptions raised during connection.
+        """
         errors = await self.ping_servers()
         if errors:
             for server_name, error in errors.items():
@@ -131,14 +136,26 @@ class MultiMCPClient:
         if self._context_depth == 0:
             await self.lc_client.__aexit__(exc_type, exc_value, traceback)
 
-    async def get_tools(self) -> list[BaseTool]:
+    async def get_tools(self) -> list[StructuredTool]:
         """Get all tools available from all connected servers."""
         # NOTE: lc loads on initial connection, so don't need to await here (in general it would be awaited though)
         async with self:
-            return self.lc_client.get_tools()
+            tools = self.lc_client.get_tools()
+        assert all(isinstance(tool, StructuredTool) for tool in tools)
+        return cast(list[StructuredTool], tools)
+
+    async def get_tools_by_server(self) -> dict[str, list[StructuredTool]]:
+        """Get tools as dict of server name to tools."""
+        async with self:
+            for all_tools in self.lc_client.server_name_to_tools.values():
+                assert all(isinstance(tool, StructuredTool) for tool in all_tools)
+            return cast(dict[str, list[StructuredTool]], self.lc_client.server_name_to_tools)
 
     async def call_tool(self, server_name: str, tool_name: str, **kwargs) -> Any:  # noqa: ANN401
-        """Call a tool on a specific server.
+        """Manually call a tool on a specific server.
+
+        Typically, the tool call will be made via the StructuredTool.func/coroutine methods (assuming the
+        tool is used within the same mcp client session as when they were loaded).
 
         Returns whatever the tool returns.
         """
